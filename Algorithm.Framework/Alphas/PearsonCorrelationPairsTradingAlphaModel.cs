@@ -13,11 +13,13 @@
  * limitations under the License.
 */
 
-using System;
-using System.Linq;
+using MathNet.Numerics.Statistics;
+using QuantConnect.Data;
 using QuantConnect.Data.UniverseSelection;
 using QuantConnect.Securities;
-using MathNet.Numerics.Statistics;
+using System;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace QuantConnect.Algorithm.Framework.Alphas
 {
@@ -59,25 +61,17 @@ namespace QuantConnect.Algorithm.Framework.Alphas
 
             var symbols = Securities.Select(x => x.Symbol).ToArray();
 
-            var history = algorithm.History(symbols, _lookback, _resolution)
-                .SelectMany(x => x.Values)
-                .GroupBy(x => x.Symbol)
-                .Select(x =>
-                {
-                    var array = x.Select(b => (double)b.Price).ToArray();
+            var history = algorithm.History(symbols, _lookback, _resolution);
 
-                    for (var i = array.Length - 1; i > 0; i--)
-                    {
-                        array[i] = Math.Log(array[i]) - Math.Log(array[i - 1]);
-                    }
-                    array[0] = 0;
+            var vectors = GetPriceVectors(history);
 
-                    return array;
-                });
-
-            if (history.Count() > 0)
+            if (vectors.Count() == 0)
             {
-                var pearsonMatrix = Correlation.PearsonMatrix(history).UpperTriangle();
+                algorithm.Debug($"PearsonCorrelationPairsTradingAlphaModel.OnSecuritiesChanged(): The requested historical data does not have series of prices with the same date/time. Please consider increasing the looback period. Current lookback: {_lookback}");
+            }
+            else
+            {
+                var pearsonMatrix = Correlation.PearsonMatrix(vectors).UpperTriangle();
 
                 var maxValue = pearsonMatrix.Enumerate().Where(x => Math.Abs(x) < 1).Max();
                 if (maxValue >= _minimumCorrelation)
@@ -100,6 +94,60 @@ namespace QuantConnect.Algorithm.Framework.Alphas
         public override bool HasPassedTest(QCAlgorithmFramework algorithm, Symbol asset1, Symbol asset2)
         {
             return _bestPair != null && asset1 == _bestPair.Item1 && asset2 == _bestPair.Item2;
+        }
+
+        private IEnumerable<double[]> GetPriceVectors(IEnumerable<Slice> slices)
+        {
+            var symbols = Securities.Select(x => x.Symbol).ToArray();
+            var timeZones = Securities.ToDictionary(x => x.Symbol, y => y.Exchange.TimeZone);
+            var isSingleTimeZone = timeZones.Values.Distinct().Count() == 1;
+
+            if (isSingleTimeZone)
+            {
+                return slices
+                    .Where(x => x.Count == symbols.Length)
+                    .SelectMany(x => x.Values)
+                    .GroupBy(x => x.Symbol)
+                    .Select(x =>
+                    {
+                        var array = x.Select(b => Math.Log((double)b.Price)).ToArray();
+                        for (var i = array.Length - 1; i > 0; i--)
+                        {
+                            array[i] = array[i] - array[i - 1];
+                        }
+                        array[0] = array[1];
+                        return array;
+                    });
+            }
+            else
+            {
+                return slices
+                    .SelectMany(x => x.Values.Select(d =>
+                    {
+                        var utcEndTime = d.EndTime.ConvertToUtc(timeZones[d.Symbol]);
+                        if (_resolution == Resolution.Daily)
+                        {
+                            utcEndTime = utcEndTime.Date;
+                        }
+                        return Tuple.Create(utcEndTime, d.Symbol, d.Price);
+                    }))
+                    // Group by UTC time and only accept data from days with all symbols
+                    .GroupBy(x => x.Item1)
+                    .Where(x => x.Count() == symbols.Length)
+                    .SelectMany(x => x.Select(y => y))
+                    // Group by Symbol and return an array of LogPrice difference
+                    .GroupBy(x => x.Item2)
+                    .Select(x =>
+                    {
+                        var array = x.Select(b => Math.Log((double)b.Item3)).ToArray();
+                        for (var i = array.Length - 1; i > 0; i--)
+                        {
+                            array[i] = array[i] - array[i - 1];
+                        }
+                        array[0] = array[1];
+                        return array;
+                    });
+            }
         }
     }
 }
